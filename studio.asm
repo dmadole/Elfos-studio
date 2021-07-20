@@ -1,3 +1,4 @@
+; This software is copyright 2021 by David S. Madole.
 ; You have permission to use, modify, copy, and distribute
 ; this software so long as this copyright notice is retained.
 ; This software may not be used in commercial applications
