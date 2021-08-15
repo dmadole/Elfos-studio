@@ -13,3 +13,5 @@ This is still a work in progress, but works well for what is implemented. This r
 
 Input flow control is planned still, as well as an attempt to get the speed up to 57,600 baud if possible.
 
+**Q: Why is it named "studio"?**
+A: Because I create a lot of programs that end in "o"; since it is a console driber, as a play on stdio.h which is a standard library for I/O in the C language; and because it is for the 18**54** UART, as an homage to "Studio 54," the former New York City disco nightclub.
