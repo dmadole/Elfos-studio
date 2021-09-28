@@ -1,20 +1,30 @@
-; This software is copyright 2021 by David S. Madole.
-; You have permission to use, modify, copy, and distribute
-; this software so long as this copyright notice is retained.
-; This software may not be used in commercial applications
-; without express written permission from the author.
+
+;  Copyright 2021, David S. Madole <david@madole.net>
+;
+;  This program is free software: you can redistribute it and/or modify
+;  it under the terms of the GNU General Public License as published by
+;  the Free Software Foundation, either version 3 of the License, or
+;  (at your option) any later version.
+;
+;  This program is distributed in the hope that it will be useful,
+;  but WITHOUT ANY WARRANTY; without even the implied warranty of
+;  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;  GNU General Public License for more details.
+;
+;  You should have received a copy of the GNU General Public License
+;  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
            ; Include kernel API entry points
 
-           include bios.inc
-           include kernel.inc
+include    include/bios.inc
+include    include/kernel.inc
 
 
            ; convenience definitions
 
-null       equ     0                   ; sometimes this is more expressive
-o_ivec     equ     v_ivec-1            ; make this look more like a vector
+null:      equ     0                   ; sometimes this is more expressive
+o_ivec:    equ     v_ivec-1            ; make this look more like a vector
 
 
            ; Executable program header
@@ -29,11 +39,11 @@ o_ivec     equ     v_ivec-1            ; make this look more like a vector
 
 start:     br      main
            db      8+80h              ; month
-           db      7                 ; day
+           db      25                 ; day
            dw      2021               ; year
-           dw      0                  ; build
+           dw      1                  ; build
 
-           db      'Written by David S. Madole',0
+           db      'See github.com/dmadole/Elfos-studio for more info',0
 
 
            ; Check minimum kernel version we need before doing anything else,
@@ -210,14 +220,46 @@ getbaud:   dec     ra                 ; back up to non-whitespace character
            dw      f_atoi
            lbdf    notvalid           ; if not a number then abort
 
+           ldi     8                  ; number of times to try shifting
+           plo     re
+
+shlloop:   glo     rd                 ; count left shifts until df is set
+           shl
+           plo     rd
+           ghi     rd
+           shlc
+           phi     rd
+           dec     re
+           bnf     shlloop
+
+           glo     rd                 ; rate invalid if low byte not zero
+           bnz     notvalid
+
+           ghi     rd                 ; if a 3x rate then shift in a one
+           smi     0c2h
+           bz      gotrate
+
+           smi     02ch-0c2h          ; if neither 2x or 3x rate then fail
+           bnz     notvalid
+
+           shr                        ; if a 2x rate then shift in zero
+
+gotrate:   glo     re                 ; get shift count plus 1 or 0 bit
+           shlc
+
+           ori     020h               ; set soft baud rate flag and set
+           str     r2
+           out     7
+           dec     r2
+
            ; baud rate here
 
-notvalid:  sep     r4                 ; if any argument not valid, then
-           dw      o_setbd            ; just auto-baud instead
+notvalid:  sep     r4                 ; initialize port
+           dw      o_setbd
 
            sep     scall              ; display identity to indicate success
            dw      o_inmsg
-           db      '1854 UART Driver Build 2 for Elf/OS',13,10,0
+           db      '1854 UART Driver Build 1 for Elf/OS',13,10,0
 
            sep     sret
 
@@ -293,21 +335,17 @@ setbd:     glo     rd                  ; save a register to use as pointer
            inp     6                   ; read stale input and clear status
            inp     7
 
-           sex     r3                  ; set default baud rate
-           out     7
-           db      00h
-
            sex     rd                  ; set rd as index register
 
            ldi     recvbuff            ; initialize buffer pointers to clear
            stxd                        ;  buffer, move to uartecho
            stxd
 
-           ldi     1                   ; set re.1 and uartecho to hardware
-           phi     re                  ;  uart with echo, move to uartctrl
+           ldi     13h                 ; put control-s xon into flow
            stxd
 
-           ldi     11h                 ; put control-q xon into flow
+           ldi     1                   ; set re.1 and uartecho to hardware
+           phi     re                  ;  uart with echo, move to uartctrl
            stxd
 
            out     7                   ; set uart config from uartctrl
@@ -326,42 +364,45 @@ setbd:     glo     rd                  ; save a register to use as pointer
            ; also decrements R2, so it's safe to use the top of the stack.
 
 intserv:   inp     7                   ; get status register, if da bit
-           ani     01h                 ;  not set, then pass to next isr
-           bz      intnext
+           shr                         ;  not set, then pass to next isr
+           bnf     intnext
 
            glo     rd                  ; we need a register to do much of
            stxd                        ;  anything so save rd on stack
            ghi     rd
            stxd
 
-           ghi     r1                  ; set msb of rd to variables page
+rxagain:   inp     6                   ; get input into d and m(rx)
+
+           ldi     low uartecho        ; point rd to flow control flag
+           plo     rd
+           ghi     r1
            phi     rd
 
-           inp     6                   ; get input character to d and
-           ori     02h                 ;  to stack, if not xon or xoff,
-           xri     13h                 ;  skip ahead to check buffer
-           bnz     recvchk
+           lda     rd                  ; don't check xon/xoff if no echo
+           shr
+           bnf     recvchk
 
-           ldi     low uartflow        ; otherwise, point to flow control
-           plo     rd
+           ldn     rd                  ; skip if not xon/xoff received
+           xor
+           bnz     recvchk
  
-           ldn     r2                  ; get xon or xoff character and
-           str     rd                  ;  store, and finish interrupt
+           ldn     r2                  ; complement to other of xon/xoff,
+           xri     2                   ;  store, and finish interrupt
+           str     rd
            br      intdone
 
-recvchk:   ldi     low recvtail        ; set pointer to tail variable
-           plo     rd
-
-           lda     rd                  ; get tail pointer, advance to head,
-           adi     1                   ;  increment tail, if wrapped around,
-           bnf     recvinc             ;  reset to beginning
+recvchk:   inc     rd                  ; move to tail pointer, get, move
+           lda     rd                  ;  to head, increment tail and if
+           adi     1                   ;  wrapped, reset to beginning
+           bnf     recvinc
            ldi     recvbuff
 
 recvinc:   sex     rd                  ; compare tail+1 to head,
-           xor                         ;  if equal, then buffer is full
+           sd                          ;  if equal, then buffer is full
            bz      intdone             ;  and we are done
 
-           xor                         ; recover original tail value,
+           sd                          ; recover original tail value,
            dec     rd                  ;  store into tail variable
            str     rd                  ;  and set pointer to tail of queue
            plo     rd
@@ -369,15 +410,23 @@ recvinc:   sex     rd                  ; compare tail+1 to head,
            ldn     r2                  ; put received character into queue
            str     rd
 
+
            ; Done, restore and return from interrupt
 
-intdone:   inc     r2                  ; restore saved rd register before
+intdone:   sex     r2
+
+           inp     7
+           shr
+           bdf     rxagain
+
+           inc     r2                  ; restore saved rd register before
            lda     r2                  ;  jumping to return
            phi     rd
            ldn     r2
            plo     rd
  
-           sex     r2                  ; be pessimistic about next isr,
+;           br      intserv
+
 intnext:   lbr     intnext             ;  then jump to it
 
 
@@ -399,14 +448,8 @@ goboot:    lbr     f_boot              ; continue down boot chain
            ; The varaiables here control the driver and and UART config.
 
 uartctrl:  db      39h                 ; control value to configure uart
-uartflow:  db      11h                 ; flow control character xon/xoff
 uartecho:  db      01h                 ; copy of re.1 from o_read context
-
-
-           ; The receive buffer extends from wherever it starts up through
-           ; the end of the page. It's size can only be changed by changing
-           ; the starting point, since the carry flag is used to wrap it.
-
+uartflow:  db      13h                 ; flow control character xon/xoff
 recvtail:  db      recvbuff            ; pointer to location of last byte
 recvhead:  db      recvbuff            ; pointer to just before first byte
 recvbuff:  db      0                   ; buffer data up until end of page
@@ -443,12 +486,12 @@ send:      stxd                        ; push return address
            plo     rd
 
 sendwait:  inp     7                   ; get uart status register, check if
-           xri     80h                 ;  thre is set and es- is cleared,
-           ani     90h                 ;  if not, wait until it is so
+sendsens:  xri     90h                 ;  thre is set and es- is cleared,
+sendmask:  ani     90h                 ;  if not, wait until it is so
            bnz     sendwait
 
            ldn     rd                  ; check the flow2 control flag, if it
-           xri     13h                 ;  is xoff then wait until its not
+           xri     11h                 ;  is xoff then wait until its not
            bz      sendwait
 
            glo     re                  ; get character to send, store on
@@ -621,7 +664,7 @@ gotchar:   glo     re                  ; get character
            smi     127                 ; got backspace
            bz      gotbksp
 
-           bdf     gotchar             ; has high bit set, ignore
+           bdf     getchar             ; has high bit set, ignore
 
            adi     127-32              ; printing character received
            bdf     gotprnt
