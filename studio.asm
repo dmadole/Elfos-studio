@@ -15,278 +15,306 @@
 ;  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-           ; Include kernel API entry points
 
-include    include/bios.inc
-include    include/kernel.inc
+#define EXP_PORT     5                  ; group i/o expander port
+#define UART_GROUP   0                  ; uart port group
+#define UART_DATA    6                  ; uart data port
+#define UART_STATUS  7                  ; uart status/command port
 
+#define XON  17
+#define XOFF 19
 
-           ; convenience definitions
+#define 1654_NOPAR   01h
+#define 1654_EVEN    02h
+#define 1654_2STOP   04h
+#define 1654_8BITS   18h
+#define 1654_7BITS   10h
+#define 1654_INTEN   20h
+#define 1654_BREAK   40h
+#define 1654_TXREQ   80h
 
-null:      equ     0                   ; sometimes this is more expressive
-o_ivec:    equ     v_ivec-1            ; make this look more like a vector
 
+          ; Include kernel API entry points
 
-           ; Executable program header
+#include    include/bios.inc
+#include    include/kernel.inc
 
-           org     2000h - 6
-           dw      start
-           dw      end-start
-           dw      start
 
+          ; convenience definitions
 
-           ; Build information
+null:       equ   0                     ; sometimes this is more expressive
+o_ivec:     equ   v_ivec-1              ; make this look more like a vector
 
-start:     br      main
-           db      8+80h              ; month
-           db      25                 ; day
-           dw      2021               ; year
-           dw      1                  ; build
 
-           db      'See github.com/dmadole/Elfos-studio for more info',0
+          ; Executable program header
 
+            org   2000h - 6
+            dw    start
+            dw    end-start
+            dw    start
 
-           ; Check minimum kernel version we need before doing anything else,
-           ; in particular we need support for the heap manager to allocate
-           ; memory for the persistent module to use.
 
-main:      ldi     high k_ver          ; get pointer to kernel version
-           phi     r7
-           ldi     low k_ver
-           plo     r7
+          ; Build information
 
-           lda     r7                  ; if major is non-zero we are good
-           lbnz    allocmem
+start:      br    main
+            db    5+80h                 ; month
+            db    10                    ; day
+            dw    2024                  ; year
+            dw    2                     ; build
 
-           lda     r7                  ; if major is zero and minor is 4
-           smi     4                   ;  or higher we are good
-           lbdf    allocmem
+            db   'See github.com/dmadole/Elfos-studio for more info',0
 
-           sep     scall               ; if not meeting minimum version
-           dw      o_inmsg
-           db      'ERROR: Needs kernel version 0.4.0 or higher',13,10,0
 
-           sep     sret
+          ; Check minimum kernel version we need before doing anything else,
+          ; in particular we need support for the heap manager to allocate
+          ; memory for the persistent module to use.
 
+main:       ldi   high k_ver            ; get pointer to kernel version
+            phi   r7
+            ldi   low k_ver
+            plo   r7
 
-           ; Allocate memory from the heap for the driver code block, leaving
-           ; address of block in register R8 and RF for copying code and
-           ; hooking vectors and the length of code to copy in RB.
+            lda   r7                    ; if major is non-zero we are good
+            lbnz  getbaud
 
-allocmem:  ldi     high end-module     ; size of permanent code module
-           phi     rb
-           phi     rc
-           ldi     low end-module
-           plo     rb
-           plo     rc
+            lda   r7                    ; if major is zero and minor is 4
+            smi   4                     ;  or higher we are good
+            lbdf  getbaud
 
-           ldi     255                 ; request page-aligned block
-           phi     r7
-           ldi     4                   ; request permanent block
-           plo     r7
+            sep   scall                 ; if not meeting minimum version
+            dw    o_inmsg
+            db   'ERROR: Needs kernel version 0.4.0 or higher',13,10,0
 
-           sep     scall               ; allocate block on heap
-           dw      o_alloc
-           lbnf    copycode
+            sep   sret
 
-           sep     scall               ; if unable to get memory
-           dw      o_inmsg
-           db      'ERROR: Unable to allocate heap memory',13,10,0
 
-           sep     sret
+          ; We are almost done, but process any command-line arguments.
 
+getbaud:    ldi   0                     ; baud rate register default
+            plo   r9
 
-           ; Copy the code of the persistent module to the memory block that
-           ; was just allocated using RF for destination and RB for length.
-           ; This burns RF and RB but R8 will still point to the block.
+skipspc1:   lda   ra                    ; skip any whitespace
+            lbz   allocmem
+            smi   '!'
+            lbnf  skipspc1
 
-copycode:  ldi     high module         ; get source address to copy from
-           phi     rd
-           ldi     low module
-           plo     rd
+            dec   ra                    ; back up to non-whitespace character
 
-           glo     rf                  ; make a copy of block pointer
-           plo     r8
-           ghi     rf
-           phi     r8
+            ghi   ra                    ; move input pointer to rf
+            phi   rf
+            glo   ra
+            plo   rf
 
-copyloop:  lda     rd                  ; copy code to destination address
-           str     rf
-           inc     rf
-           dec     rb
-           glo     rb
-           lbnz    copyloop
-           ghi     rb
-           lbnz    copyloop
-
-           ghi     r8                  ; put offset between source and
-           smi     high module         ;  destination onto stack
-           str     r2
-
+            sep   scall                 ; parse input number
+            dw    f_atoi
+            lbdf  notvalid              ; if not a number then abort
 
-           ; Disable interrupts while we manipulate the interrupt service
-           ; chain, R1, and other hooks, so that we don't get an interrupt
-           ; when things are half-baked like msb is changed but not lsb.
-
-           sex     r3                  ; disable interrupts, leaving x=2
-           dis
-           db      23h
-
-
-           ; Update kernel hooks to point to our module code. Use the offset
-           ; to the heap block at M(R2) to update module addresses to match
-           ; the copy in the heap. If there is a chain address needed for a
-           ; hook, copy that to the module first in the same way.
-
-           ldi     high patchtbl      ; Get point to table of patch points
-           phi     r7
-           ldi     low patchtbl
-           plo     r7
-
-ptchloop:  lda     r7                 ; get address to patch, a zero
-           lbz     intenabl           ;  msb marks end of the table
-           phi     rd
-           lda     r7
-           plo     rd
-           inc     rd
-
-           lda     r7                 ; if chain needed, then get address,
-           lbz     notchain           ;  adjust to heap memory block
-           add
-           phi     rf
-           ldn     r7
-           plo     rf
-           inc     rf
+skipspc2:   lda   rf                    ; skip any whitespace
+            lbz   getrate
+            smi   '!'
+            lbnf  skipspc2
 
-           lda     rd                 ; patch chain lbr in module code
-           str     rf                 ;  to existing vector address
-           inc     rf
-           ldn     rd
-           str     rf
-           dec     rd
+notvalid:   sep   scall
+            dw    o_inmsg
+            db    'USAGE: studio [baud]',13,10,0
 
-notchain:  inc     r7                 ; get module call point, adjust to
-           lda     r7                 ;  heap, and update into vector jump
-           add
-           str     rd
-           inc     rd
-           lda     r7
-           str     rd
+            sep   sret
 
-           lbr     ptchloop
 
+getrate:    ldi   8                     ; number of times to try shifting
+            plo   re
 
-           ; Set R1 to point to the Elf/OS interrupt service routine and
-           ; re-enable interrupts; since all the interrupt-level stuff has
-           ; been changed it should be safe to do now.
-
-intenabl:  ldi     high i_serve        ; set interrupt program counter
-           phi     r1
-           ldi     low i_serve
-           plo     r1
+shlloop:    glo   rd                    ; count left shifts until df is set
+            shl
+            plo   rd
+            ghi   rd
+            shlc
+            phi   rd
+            dec   re
+            bnf   shlloop
 
-           sex     r3                  ; enable interrupts, leaving x=2
-           ret
-           db      23h
+            glo   rd                    ; rate invalid if low byte not zero
+            bnz   notvalid
 
+            ghi   rd                    ; if a 3x rate then shift in a one
+            smi   0c2h
+            bz    gotrate
 
-           ; We are almost done, but process any command-line arguments.
+            smi   02ch-0c2h             ; if neither 2x or 3x rate then fail
+            bnz   notvalid
 
-skipspc1:  lda     ra                 ; skip any whitespace
-           lbz     notvalid
-           smi     '!'
-           lbnf    skipspc1
+            shr                         ; if a 2x rate then shift in zero
+
+gotrate:    glo   re                    ; get shift count plus 1 or 0 bit
+            shlc
+
+            ori   20h                   ; set soft baud rate flag and set
+            plo   r9
+
+
+          ; Allocate memory from the heap for the driver code block, leaving
+          ; address of block in register R8 and RF for copying code and
+          ; hooking vectors and the length of code to copy in RB.
+
+allocmem:   ldi   (end-module).1        ; size of permanent code module
+            phi   rb
+            phi   rc
+            ldi   (end-module).0
+            plo   rb
+            plo   rc
+
+            ldi   255                   ; request page-aligned block
+            phi   r7
+            ldi   4                     ; request permanent block
+            plo   r7
+
+            sep   scall                 ; allocate block on heap
+            dw    o_alloc
+            lbnf  copycode
+
+            sep   scall                 ; if unable to get memory
+            dw    o_inmsg
+            db    'ERROR: Unable to allocate heap memory',13,10,0
 
-           smi     '-'-'!'            ; if next character is not a dash,
-           lbnz    getbaud            ; then no option
+            sep   sret
 
-           lda     ra                 ; if option is not 'k' then it is
-           smi     'k'                ; not valid
-           lbnz    notvalid
 
-skipspc2:  lda     ra                 ; skip any whitespace
-           lbz     notvalid
-           smi     '!'
-           lbnf    skipspc2
+          ; Copy the code of the persistent module to the memory block that
+          ; was just allocated using RF for destination and RB for length.
+          ; This burns RF and RB but R8 will still point to the block.
 
-getbaud:   dec     ra                 ; back up to non-whitespace character
+copycode:   ldi   high module           ; get source address to copy from
+            phi   rd
+            ldi   low module
+            plo   rd
 
-           ghi     ra                 ; move input pointer to rf
-           phi     rf
-           glo     ra
-           plo     rf
+            glo   rf                    ; make a copy of block pointer
+            plo   r8
+            ghi   rf
+            phi   r8
 
-           sep     r4                 ; parse input number
-           dw      f_atoi
-           lbdf    notvalid           ; if not a number then abort
+copyloop:   lda   rd                    ; copy code to destination address
+            str   rf
+            inc   rf
+            dec   rb
+            glo   rb
+            lbnz  copyloop
+            ghi   rb
+            lbnz  copyloop
 
-           ldi     8                  ; number of times to try shifting
-           plo     re
+            ghi   r8                    ; put offset between source and
+            smi   high module           ;  destination onto stack
+            str   r2
 
-shlloop:   glo     rd                 ; count left shifts until df is set
-           shl
-           plo     rd
-           ghi     rd
-           shlc
-           phi     rd
-           dec     re
-           bnf     shlloop
 
-           glo     rd                 ; rate invalid if low byte not zero
-           bnz     notvalid
+          ; Disable interrupts while we manipulate the interrupt service
+          ; chain, R1, and other hooks, so that we don't get an interrupt
+          ; when things are half-baked like msb is changed but not lsb.
 
-           ghi     rd                 ; if a 3x rate then shift in a one
-           smi     0c2h
-           bz      gotrate
+            sex   r3                    ; disable interrupts, leaving x=2
+            dis
+            db    23h
 
-           smi     02ch-0c2h          ; if neither 2x or 3x rate then fail
-           bnz     notvalid
 
-           shr                        ; if a 2x rate then shift in zero
+          ; Update kernel hooks to point to our module code. Use the offset
+          ; to the heap block at M(R2) to update module addresses to match
+          ; the copy in the heap. If there is a chain address needed for a
+          ; hook, copy that to the module first in the same way.
 
-gotrate:   glo     re                 ; get shift count plus 1 or 0 bit
-           shlc
+            ldi   patchtbl.1            ; Get point to table of patch points
+            phi   r7
+            ldi   patchtbl.0
+            plo   r7
 
-           ori     020h               ; set soft baud rate flag and set
-           str     r2
-           out     7
-           dec     r2
+ptchloop:   lda   r7                    ; get address to patch, a zero
+            lbz   intenabl              ;  msb marks end of the table
+            phi   rd
+            lda   r7
+            plo   rd
+            inc   rd
 
-           ; baud rate here
+            lda   r7                    ; if chain needed, then get address,
+            lbz   notchain              ;  adjust to heap memory block
+            add
+            phi   rf
+            ldn   r7
+            plo   rf
+            inc   rf
 
-notvalid:  sep     r4                 ; initialize port
-           dw      o_setbd
+            lda   rd                    ; patch chain lbr in module code
+            str   rf                    ;  to existing vector address
+            inc   rf
+            ldn   rd
+            str   rf
+            dec   rd
 
-           sep     scall              ; display identity to indicate success
-           dw      o_inmsg
-           db      '1854 UART Driver Build 1 for Elf/OS',13,10,0
+notchain:   inc   r7                    ; get module call point, adjust to
+            lda   r7                    ;  heap, and update into vector jump
+            add
+            str   rd
+            inc   rd
+            lda   r7
+            str   rd
 
-           sep     sret
+            lbr   ptchloop
 
 
-           ; Table giving addresses of jump vectors we need to update to
-           ; point to us instead, and what to point them to. The patching
-           ; code adjusts the target address to the heap memory block.
+          ; Set R1 to point to the Elf/OS interrupt service routine and
+          ; re-enable interrupts; since all the interrupt-level stuff has
+          ; been changed it should be safe to do now.
 
-patchtbl:  dw      o_ivec, intnext, intserv
-           dw      o_boot, goboot, reboot
-           dw      o_type, null, type
-           dw      o_tty, null, type
-           dw      o_readkey, null, read
-           dw      o_msg, null, msg
-           dw      o_inmsg, null, inmsg
-           dw      o_input, null, input
-           dw      o_inputl, null, inputl
-           dw      o_setbd, null, setbd
-           db      null
+intenabl:   ldi   high i_serve          ; set interrupt program counter
+            phi   r1
+            ldi   low i_serve
+            plo   r1
 
+            sex   r3                    ; enable interrupts, leaving x=2
+            ret
+            db    23h
 
-           ; Start the actual module code on a new page so that it forms
-           ; a block of page-relocatable code that will be copied to himem.
 
-           org     (($ + 0ffh) & 0ff00h)
+          ; baud rate here
 
-module:    ; Memory-resident module code starts here
+            glo   r9
+            lbz   skprate
+
+            str   r2
+            out   UART_STATUS
+            dec   r2
+
+skprate:    sep   scall
+            dw    o_setbd
+
+            sep   scall              ; display identity to indicate success
+            dw    o_inmsg
+            db    '1854 UART Driver Build 2 for Elf/OS',13,10,0
+
+            sep   sret
+
+
+          ; Table giving addresses of jump vectors we need to update to
+          ; point to us instead, and what to point them to. The patching
+          ; code adjusts the target address to the heap memory block.
+
+patchtbl:   dw    o_ivec, intnext, intserv
+            dw    o_boot, goboot, reboot
+            dw    o_type, null, type
+            dw    o_tty, null, type
+            dw    o_readkey, null, read
+            dw    o_msg, null, msg
+            dw    o_inmsg, null, inmsg
+            dw    o_input, null, input
+            dw    o_inputl, null, inputl
+            dw    o_setbd, null, setbd
+            db    null
+
+
+          ; Start the actual module code on a new page so that it forms
+          ; a block of page-relocatable code that will be copied to himem.
+
+            org   (($ + 0ffh) & 0ff00h)
+
+module:   ; Memory-resident module code starts here
 
 
 ; Within this module, a simplified subroutine convention is used to save
@@ -294,18 +322,18 @@ module:    ; Memory-resident module code starts here
 ; way a call is done is to load the return address within the page into the
 ; D register, and then do a short branch to the subroutine:
 ;
-;          ldi     retaddr
-;          br      subroutine
+;           ldi   retaddr
+;           br    subroutine
 ;
 ; The subroutine pushes the return address to the stack, does it's work,
 ; then returns by popping the return address and setting it into the low
 ; byte of the program counter, effecting a branch:
 ;
-;          stxd
-;          ...
-;          irx
-;          ldx
-;          plo     r3
+;           stxd
+;           ...
+;           irx
+;           ldx
+;           plo   r3
 ;
 ; This takes just 6 instructions as compared to SCRT which takes 32 as it is
 ; implemented in Elf/OS. Obviously this only works within a single page of
@@ -320,443 +348,446 @@ module:    ; Memory-resident module code starts here
 ; IPSO FACTO issue 12 (June 1979).
 
 
-           ; Initialize port
+          ; Initialize port
 
-setbd:     glo     rd                  ; save a register to use as pointer
-           stxd
-           ghi     rd
-           stxd
+setbd:      glo   rd                    ; save a register to use as pointer
+            stxd
+            ghi   rd
+            stxd
 
-           ghi     r3                  ; get pointer to the recvhead variable
-           phi     rd
-           ldi     low recvhead
-           plo     rd
+            ghi   r3                    ; get pointer to the recvhead variable
+            phi   rd
+            ldi   low recvhead
+            plo   rd
 
-           inp     6                   ; read stale input and clear status
-           inp     7
+            inp   UART_DATA             ; read stale input and clear status
+            inp   UART_STATUS
 
-           sex     rd                  ; set rd as index register
+            sex   rd                    ; set rd as index register
 
-           ldi     recvbuff            ; initialize buffer pointers to clear
-           stxd                        ;  buffer, move to uartecho
-           stxd
+            ldi   recvbuff              ; initialize buffer pointers to clear
+            stxd                        ;  buffer, move to uartecho
+            stxd
 
-           ldi     13h                 ; put control-s xon into flow
-           stxd
+            ldi   XOFF                   ; put control-s xon into flow
+            stxd
 
-           ldi     1                   ; set re.1 and uartecho to hardware
-           phi     re                  ;  uart with echo, move to uartctrl
-           stxd
+            ldi   1                     ; set re.1 and uartecho to hardware
+            phi   re                    ;  uart with echo
 
-           out     7                   ; set uart config from uartctrl
+            sex   r3
+            out   UART_STATUS           ; set uart config from uartctrl
+            db    1654_INTEN+1654_8BITS+1654_NOPAR
 
-           inc     r2                  ; restore saved register
-           lda     r2
-           phi     rd
-           ldn     r2
-           plo     rd
+            inc   r2                    ; restore saved register
+            lda   r2
+            phi   rd
+            ldn   r2
+            plo   rd
 
-           sep     sret                ;  return to caller
+            sep   sret                  ;  return to caller
 
 
-           ; This interrupt service routine is called by the Elf/OS stub
-           ; service routine which saves the X, P, D, and DF registers. It
-           ; also decrements R2, so it's safe to use the top of the stack.
+          ; This interrupt service routine is called by the Elf/OS stub
+          ; service routine which saves the X, P, D, and DF registers. It
+          ; also decrements R2, so it's safe to use the top of the stack.
 
-intserv:   inp     7                   ; get status register, if da bit
-           shr                         ;  not set, then pass to next isr
-           bnf     intnext
+intserv:    inp   EXP_PORT              ; save current port group
+            dec   r2
 
-           glo     rd                  ; we need a register to do much of
-           stxd                        ;  anything so save rd on stack
-           ghi     rd
-           stxd
+            sex   r1                    ; set port group for uart
+            out   EXP_PORT
+            db    UART_GROUP
+            sex   r2
 
-rxagain:   inp     6                   ; get input into d and m(rx)
+            inp   UART_STATUS           ; get status register, if da bit
+            shr                         ;  not set, then pass to next isr
+            bnf   intnext
 
-           ldi     low uartecho        ; point rd to flow control flag
-           plo     rd
-           ghi     r1
-           phi     rd
+            glo   rd                    ; we need a register to do much of
+            stxd                        ;  anything so save rd on stack
+            ghi   rd
+            stxd
 
-           lda     rd                  ; don't check xon/xoff if no echo
-           shr
-           bnf     recvchk
+            ghi   r1
+            phi   rd
 
-           ldn     rd                  ; skip if not xon/xoff received
-           xor
-           bnz     recvchk
+rxagain:    inp   UART_DATA             ; get input into d and m(rx)
+
+            ldi   uartecho.0            ; point rd to flow control flag
+            plo   rd
+
+            lda   rd                    ; don't check xon/xoff if no echo
+            shr
+            bnf   recvchk
+
+            ldn   rd                    ; skip if not xon/xoff received
+            sm
+            bnz   recvchk
  
-           ldn     r2                  ; complement to other of xon/xoff,
-           xri     2                   ;  store, and finish interrupt
-           str     rd
-           br      intdone
+            ldi   XON+XOFF              ; complement to other of xon/xoff,
+            sm
+            str   rd
 
-recvchk:   inc     rd                  ; move to tail pointer, get, move
-           lda     rd                  ;  to head, increment tail and if
-           adi     1                   ;  wrapped, reset to beginning
-           bnf     recvinc
-           ldi     recvbuff
+            br    intdone
 
-recvinc:   sex     rd                  ; compare tail+1 to head,
-           sd                          ;  if equal, then buffer is full
-           bz      intdone             ;  and we are done
+recvchk:    inc   rd                    ; move to tail pointer, get, move
+            lda   rd                    ;  to head, increment tail and if
+            adi   1                     ;  wrapped, reset to beginning
+            bnf   recvinc
+            ldi   recvbuff
 
-           sd                          ; recover original tail value,
-           dec     rd                  ;  store into tail variable
-           str     rd                  ;  and set pointer to tail of queue
-           plo     rd
+recvinc:    sex   rd                    ; compare tail+1 to head,
+            sd                          ;  if equal, then buffer is full
+            bz    intdone               ;  and we are done
 
-           ldn     r2                  ; put received character into queue
-           str     rd
+            sd                          ; recover original tail value,
+            dec   rd                    ;  store into tail variable
+            str   rd                    ;  and set pointer to tail of queue
+            plo   rd
+
+            ldn   r2                    ; put received character into queue
+            str   rd
 
 
-           ; Done, restore and return from interrupt
+          ; Done, restore and return from interrupt
 
-intdone:   sex     r2
+intdone:    sex   r2
 
-           inp     7
-           shr
-           bdf     rxagain
+            inp   UART_STATUS
+            shr
+            bdf   rxagain
 
-           inc     r2                  ; restore saved rd register before
-           lda     r2                  ;  jumping to return
-           phi     rd
-           ldn     r2
-           plo     rd
+            irx                         ; restore saved rd register before
+            ldxa                        ;  jumping to return
+            phi   rd
+            ldxa
+            plo   rd
  
-;           br      intserv
+            out   EXP_PORT
+            dec   r2
 
-intnext:   lbr     intnext             ;  then jump to it
+intnext:    lbr   intnext               ;  then jump to it
 
 
-           ; This is hooked into o_boot to reset the UART to the same
-           ; condition as if the machine was reset. This is especially
-           ; important to disable interrupts so an unexpected one does not
-           ; arrive after the reboot before the handler has been installed.
+          ; This is hooked into o_boot to reset the UART to the same
+          ; condition as if the machine was reset. This is especially
+          ; important to disable interrupts so an unexpected one does not
+          ; arrive after the reboot before the handler has been installed.
 
-reboot:    sex     r3                  ; make arguments inline values
+reboot:     sex   r3                    ; make arguments inline values
 
-           out     7                   ; disable interrupts from uart
-           db      10h
-           out     7                   ; reset default baud rate
-           db      00h
+            out   UART_STATUS           ; disable interrupts from uart
+            db    1654_7BITS
+            out   UART_STATUS           ; reset default baud rate
+            db    00h
 
-goboot:    lbr     f_boot              ; continue down boot chain
+goboot:     lbr   f_boot                ; continue down boot chain
            
 
-           ; The varaiables here control the driver and and UART config.
+          ; The varaiables here control the driver and and UART config.
 
-uartctrl:  db      39h                 ; control value to configure uart
-uartecho:  db      01h                 ; copy of re.1 from o_read context
-uartflow:  db      13h                 ; flow control character xon/xoff
-recvtail:  db      recvbuff            ; pointer to location of last byte
-recvhead:  db      recvbuff            ; pointer to just before first byte
-recvbuff:  db      0                   ; buffer data up until end of page
+uartecho:   db    01h                   ; copy of re.1 from o_read context
+uartflow:   db    XOFF                  ; flow control character xon/xoff
+recvtail:   db    recvbuff              ; pointer to location of last byte
+recvhead:   db    recvbuff              ; pointer to just before first byte
+recvbuff:   db    0                     ; buffer data up until end of page
 
 
-           org     (($ + 0ffh) & 0ff00h)
+            org   (($ + 0ffh) & 0ff00h)
 
 
-           ; This is the replacement for the standard f_type call in BIOS.
-           ; It outputs a single character through the UART via polling and
-           ; is called with SCRT, but falls through to the "thin call" send
-           ; subroutine, to save a branch. Every instruction counts here!
+          ; This is the replacement for the standard f_type call in BIOS.
+          ; It outputs a single character through the UART via polling and
+          ; is called with SCRT, but falls through to the "thin call" send
+          ; subroutine, to save a branch. Every instruction counts here!
 
-type:      glo     rd                  ; save rd to use as an index to data
-           stxd
-           ghi     rd
-           stxd
+type:       glo   rd                    ; save rd to use as an index to data
+            stxd
+            ghi   rd
+            stxd
 
-           ghi     r3                  ; load data page address into rd.1
-           smi     1
-           phi     rd
+            ghi   r3                    ; load data page address into rd.1
+            smi   1
+            phi   rd
 
-           ldi     return              ; return to standard return block
+            ldi   return                ; return to standard return block
 
 
-           ; This "thin call" subroutine sends one character through the
-           ; UART. Is assumes that RD.1 has been set with the data page
-           ; address and that it can freely modify RD.0 ; The character to
-           ; send is passed in RE.0 and is left unchanged on exit.
+          ; This "thin call" subroutine sends one character through the
+          ; UART. Is assumes that RD.1 has been set with the data page
+          ; address and that it can freely modify RD.0 ; The character to
+          ; send is passed in RE.0 and is left unchanged on exit.
 
-send:      stxd                        ; push return address
+send:       stxd                        ; push return address
 
-           ldi     low uartflow        ; point to xon/xoff flow control flag
-           plo     rd
+            ldi   uartflow.0            ; point to xon/xoff flow control flag
+            plo   rd
 
-sendwait:  inp     7                   ; get uart status register, check if
-sendsens:  xri     90h                 ;  thre is set and es- is cleared,
-sendmask:  ani     90h                 ;  if not, wait until it is so
-           bnz     sendwait
+sendflow:   ldn   rd                    ; check the flow2 control flag, if it
+            xri   XON                   ;  is xon then wait until its not
+            bz    sendflow
 
-           ldn     rd                  ; check the flow2 control flag, if it
-           xri     11h                 ;  is xoff then wait until its not
-           bz      sendwait
+sendwait:   inp   UART_STATUS           ; get uart status register, check if
+            xri   90h                   ;  thre is set and es- is cleared,
+            ani   90h                   ;  if not, wait until it is so
+            bnz   sendwait
 
-           glo     re                  ; get character to send, store on
-           str     r2                  ;  stack, output, and inc r2
-           out     6
+            glo   re                    ; get character to send, store on
+            str   r2                    ;  stack, output, and inc r2
+            out   UART_DATA
 
-           ldn     r2                  ; get return address and jump
-           plo     r3
+            ldn   r2                    ; get return address and jump
+            plo   r3
 
 
-           ; This is a standard return block that is used in common by
-           ; several of the routines. It can either be set as the return
-           ; address in a "thin call" subroutine or branched to directly.
+          ; This is a standard return block that is used in common by
+          ; several of the routines. It can either be set as the return
+          ; address in a "thin call" subroutine or branched to directly.
 
-return:    inc     r2                  ; restore saved rd register
-           lda     r2
-           phi     rd
-           ldn     r2
-           plo     rd
-           
-           glo     re                  ; get result and return via scrt
-           sep     sret
+return:     inc   r2                    ; restore saved rd register
+            lda   r2
+            phi   rd
+            ldn   r2
+            plo   rd
+            
+            glo   re                    ; get result and return via scrt
+            sep   sret
 
 
-           ; This is the replacement for the f_msg call which sends a null-
-           ; terminated string pointed to by RF. It calls the "thin call"
-           ; send subroutine for each character.
+          ; This is the replacement for the f_msg call which sends a null-
+          ; terminated string pointed to by RF. It calls the "thin call"
+          ; send subroutine for each character.
 
-msg:       glo     rd                  ; save r3 for data pointer
-           stxd
-           ghi     rd
-           stxd
+msg:        glo   rd                    ; save r3 for data pointer
+            stxd
+            ghi   rd
+            stxd
 
-           ghi     r3                  ; set r3 to point to data page
-           smi     1
-           phi     rd
+            ghi   r3                    ; set r3 to point to data page
+            smi   1
+            phi   rd
 
-msgloop:   lda     rf                  ; get next character, incrementing
-           bz      return              ;  pointer, if end, then return
-           plo     re
+msgloop:    lda   rf                    ; get next character, incrementing
+            bz    return                ;  pointer, if end, then return
+            plo   re
 
-           ldi     msgloop             ; call the send subroutine, returning
-           br      send                ;  to above to effect the needed loop
+            ldi   msgloop               ; call the send subroutine, returning
+            br    send                  ;  to above to effect the needed loop
 
 
-           ; This is the replacement for the f_inmsg call which is just like
-           ; f_msg but uses R6 as an index instead of RF and so sends a null-
-           ; terminated string that is inline to the SCALL.
+          ; This is the replacement for the f_inmsg call which is just like
+          ; f_msg but uses R6 as an index instead of RF and so sends a null-
+          ; terminated string that is inline to the SCALL.
 
-inmsg:     glo     rd                  ; save r3 for data pointer
-           stxd
-           ghi     rd
-           stxd
+inmsg:      glo   rd                    ; save r3 for data pointer
+            stxd
+            ghi   rd
+            stxd
 
-           ghi     r3                  ; set r3 to point to data page
-           smi     1
-           phi     rd
+            ghi   r3                    ; set r3 to point to data page
+            smi   1
+            phi   rd
 
-inmsglp:   lda     r6                  ; get next character, incrementing
-           bz      return              ;  pointer, if end, then return
-           plo     re
+inmsglp:    lda   r6                    ; get next character, incrementing
+            bz    return                ;  pointer, if end, then return
+            plo   re
 
-           ldi     inmsglp             ; call the send subroutine, returning
-           br      send                ;  to above to effect the needed loop
+            ldi   inmsglp               ; call the send subroutine, returning
+            br    send                  ;  to above to effect the needed loop
 
 
-           ; This is the replacement for the f_read call which gets a
-           ; character from the input. This reads from the input buffer that
-           ; the interrupt routing populates received data into. This has a
-           ; tiny wrapper around the "thin call" recv subroutine that it falls
-           ; through to that actually does all the work.
+          ; This is the replacement for the f_read call which gets a
+          ; character from the input. This reads from the input buffer that
+          ; the interrupt routing populates received data into. This has a
+          ; tiny wrapper around the "thin call" recv subroutine that it falls
+          ; through to that actually does all the work.
 
-read:      glo     rd                  ; we need data page pointer, save rd
-           stxd 
-           ghi     rd
-           stxd
+read:       glo   rd                    ; we need data page pointer, save rd
+            stxd 
+            ghi   rd
+            stxd
 
-           ghi     r3                  ; point rd to the data page
-           smi     1
-           phi     rd
+            ghi   r3                    ; point rd to the data page
+            smi   1
+            phi   rd
 
-           ldi     chkecho             ; get next input character
-           br      recv
+            ldi   chkecho               ; get next input character
+            br    recv
 
-chkecho:   ghi     re                  ; if echo flag not set, return
-           shr
-           bnf     return
+chkecho:    ghi   re                    ; if echo flag not set, return
+            shr
+            bnf   return
 
-           ldi     return              ; send character and return
-           br      send
+            ldi   return                ; send character and return
+            br    send
+ 
 
+          ; This "thin call" subroutine receives characters by de-queing
+          ; them from the buffer the interrupt routine populates. It needs
+          ; RD.1 set to the data page address and returns the received
+          ; character in RE.0.
 
-           ; This "thin call" subroutine receives characters by de-queing
-           ; them from the buffer the interrupt routine populates. It needs
-           ; RD.1 set to the data page address and returns the received
-           ; character in RE.0. This also chains to the send "thin call"
-           ; subroutine to echo input characters when that is enabled.
+recv:       stxd                        ; push return address
 
-recv:      stxd                        ; push return address
+            ldi   uartecho.0            ; get echo flag in re.1, save into
+            plo   rd                    ;  data page for interrupt routine use
+            ghi   re
+            str   rd
 
-           ldi     low uartecho        ; get echo flag in re.1, save into
-           plo     rd                  ;  data page for interrupt routine use
-           ghi     re
-           str     rd
+            sex   rd                    ; need to use rd value in comparisons
 
-           sex     rd                  ; need to use rd value in comparisons
+readwait:   ldi   recvtail.0            ; get index to tail pointer
+            plo   rd
 
-readwait:  ldi     low recvtail        ; get index to tail pointer
-           plo     rd
+            lda   rd                    ; if head pointer is same as tail,
+            xor                         ;  then buffer is empty, wait for data
+            bz    readwait
 
-           lda     rd                  ; if head pointer is same as tail,
-           xor                         ;  then buffer is empty, wait for data
-           bz      readwait
+            ldn   rd                    ; increment head pointer, wrapping
+            adi   1                     ;  back to start if overflows
+            bnf   readkeep
+            ldi   recvbuff
 
-           ldn     rd                  ; increment head pointer, wrapping
-           adi     1                   ;  back to start if overflows
-           bnf     readkeep
-           ldi     recvbuff
+readkeep:   str   rd                    ; update head pointer, then read
+            plo   rd                    ;  the data byte the head pointer
+            ldn   rd                    ;  points to and put in re.0
+            plo   re
 
-readkeep:  str     rd                  ; update head pointer, then read
-           plo     rd                  ;  the data byte the head pointer
-           ldn     rd                  ;  points to and put in re.0
-           plo     re
+            sex   r2                    ; reset x register to r2
 
-           sex     r2                  ; reset x register to r2
+            inc   r2                    ; return to caller
+            ldn   r2
+            plo   r3
 
-           inc     r2                  ; return to caller
-           ldn     r2
-           plo     r3
 
 
+input:      ldi   high 256              ; preset for fixed-size version
+            phi   rc
+            ldi   low 256
+            plo   rc
 
+inputl:     dec   rc                    ; space for terminating zero
 
+            glo   rd                    ; use rd for data page pointer
+            stxd
+            ghi   rd
+            stxd
 
+            glo   rb                    ; use rb for counting input
+            stxd
+            ghi   rb
+            stxd
 
+            ghi   r3                    ; point rd to the data page
+            smi   1
+            phi   rd
 
+            ldi   0                     ; zero input count
+            phi   rb
+            plo   rb
 
+getchar:    ldi   gotchar               ; read input character
+            br    recv
 
+gotchar:    glo   re                    ; get character
 
-input:     ldi     high 256            ; preset for fixed-size version
-           phi     rc
-           ldi     low 256
-           plo     rc
+            smi   127                   ; got backspace
+            bz    gotbksp
 
-inputl:    dec     rc                  ; space for terminating zero
+            bdf   getchar               ; has high bit set, ignore
 
-           glo     rd                  ; use rd for data page pointer
-           stxd
-           ghi     rd
-           stxd
+            adi   127-32                ; printing character received
+            bdf   gotprnt
 
-           glo     rb                  ; use rb for counting input
-           stxd
-           ghi     rb
-           stxd
+            adi   32-8                  ; backspace received
+            bz    gotbksp
 
-           ghi     r3                  ; point rd to the data page
-           smi     1
-           phi     rd
+            adi   8-3                   ; control-c received
+            bz    gotctlc
 
-           ldi     0                   ; zero input count
-           phi     rb
-           plo     rb
+            adi   3-13                  ; carriage return received
+            bnz   getchar
 
-getchar:   ldi     gotchar             ; read input character
-           br      recv
 
-gotchar:   glo     re                  ; get character
+          ; Return from input due to either return or control-c. When
+          ; either entry point is called, D will be zero and DF will be
+          ; set as a result of the subtraction used for comparison.
 
-           smi     127                 ; got backspace
-           bz      gotbksp
+gotctlc:    str   rf                    ; zero-terminate input string
 
-           bdf     getchar             ; has high bit set, ignore
+            inc   r2                    ; restore saved rb
+            lda   r2
+            phi   rb
+            ldn   r2
+            plo   rb
 
-           adi     127-32              ; printing character received
-           bdf     gotprnt
+            ghi   re                    ; if not return or echo not enabled,
+            shr                         ;  don't echo anything, but save
+            glo   re                    ;  input char to stack along the way
+            stxd
+            smbi  13
+            bnz   notecho
 
-           adi     32-8                ; backspace received
-           bz      gotbksp
+            ldi   notecho               ; output return
+            br    send
 
-           adi     8-3                 ; control-c received
-           bz      gotctlc
+notecho:    irx                         ; get back character typed, if 3
+            ldx                         ;  then set df, if 13 then clear df
+            sdi   3
 
-           adi     3-13               ; carriage return received
-           bnz     getchar
+            br    return
 
 
-           ; Return from input due to either return or control-c. When
-           ; either entry point is called, D will be zero and DF will be
-           ; set as a result of the subtraction used for comparison.
+          ; If a printing character, see if there is any room left in
+          ; the buffer, and append it if there is, ignore otherwise.
 
-gotctlc:   str     rf                  ; zero-terminate input string
+gotprnt:    glo   rc                    ; if any room for character
+            bnz   addprnt
+            ghi   rc                    ; if not any room for character
+            bz    getchar
 
-           inc     r2                  ; restore saved rb
-           lda     r2
-           phi     rb
-           ldn     r2
-           plo     rb
+addprnt:    glo   re
+            str   rf                    ; append character to buffer
+            inc   rf
 
-           ghi     re                  ; if not return or echo not enabled,
-           shr                         ;  don't echo anything, but save
-           glo     re                  ;  input char to stack along the way
-           stxd
-           smbi    13
-           bnz     notecho
+            dec   rc                    ; increment count, decrement space
+            inc   rb
 
-           ldi     notecho             ; output return
-           br      send
+            ghi   re                    ; if echo disabled, get next char
+            shr
+            bnf   getchar
 
-notecho:   irx                         ; get back character typed, if 3
-           ldx                         ;  then set df, if 13 then clear df
-           sdi     3
+            ldi   getchar               ; echo char and get next
+            br    send
 
-           br      return
 
+          ; Process a backspace received: if not at beginning of buffer,
+          ; decrement buffer and count, increment free space, and output
+          ; a backspace-space-backspace sequence to erase character.
 
-           ; If a printing character, see if there is any room left in
-           ; the buffer, and append it if there is, ignore otherwise.
+gotbksp:    glo   rb
+            bnz   dobkspc
+            ghi   rb
+            bz    getchar
 
-gotprnt:   glo     rc                  ; if any room for character
-           bnz     addprnt
-           ghi     rc                  ; if not any room for character
-           bz      getchar
+dobkspc:    dec   rf                    ; back up pointer
 
-addprnt:   glo     re
-           str     rf                  ; append character to buffer
-           inc     rf
+            dec   rb                    ; decrement count, increment space
+            inc   rc
+ 
+            ghi   re                    ; if echo disabled, get next char
+            shr
+            bnf   getchar
 
-           dec     rc                  ; increment count, decrement space
-           inc     rb
+            sep   scall
+            dw    o_inmsg
+            db    8,32,8,0
 
-           ghi     re                  ; if echo disabled, get next char
-           shr
-           bnf     getchar
+            br    getchar
 
-           ldi     getchar             ; echo char and get next
-           br      send
 
 
-           ; Process a backspace received: if not at beginning of buffer,
-           ; decrement buffer and count, increment free space, and output
-           ; a backspace-space-backspace sequence to erase character.
-
-gotbksp:   glo     rb
-           bnz     dobkspc
-           ghi     rb
-           bz      getchar
-
-dobkspc:   dec     rf                  ; back up pointer
-
-           dec     rb                  ; decrement count, increment space
-           inc     rc
-
-           ghi     re                  ; if echo disabled, get next char
-           shr
-           bnf     getchar
-
-           sep     scall
-           dw      o_inmsg
-           db      8,32,8,0
-
-           br      getchar
-
-
-
-end:       ; That's all folks!
+end:      ; That's all folks!
 
 
